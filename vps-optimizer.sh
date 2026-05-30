@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #=============================================================================
-# 宽带助手
-# 简洁版 · 命令行参数控制 · 智能推荐
+# VPS Network Optimizer v2.3
+# 简洁交互 · 极端内存支持 · 容器/OpenVZ/LXC 自动降级
 # 用法：
-#   标准优化： curl -fsSL RAW_URL | sudo bash
-#   激进模式： curl -fsSL RAW_URL | sudo bash -s -- --ultra
-#   本地运行： sudo bash vps-optimizer.sh [--ultra]
+#   curl -fsSL RAW_URL | sudo bash            # 标准菜单
+#   curl -fsSL RAW_URL | sudo bash -s -- -u   # 直接激进模式
+#   curl -fsSL RAW_URL | sudo bash -s -- -s   # 直接标准模式
 #=============================================================================
 set -e
 
@@ -16,50 +16,80 @@ warn()    { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 section() { echo ""; echo -e "${CYAN}>>> $1${NC}"; }
 
-# 解析命令行参数
-MODE="standard"
+# 默认模式
+MODE=""
+# 命令行参数
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -u|--ultra) MODE="ultra"; shift ;;
+        -s|--standard) MODE="standard"; shift ;;
         -h|--help)
-            echo "VPS Network Optimizer v2.2"
+            echo "VPS Network Optimizer v2.3"
             echo "用法: $0 [选项]"
-            echo "  -u, --ultra   激进模式（最大化带宽，有 OOM 风险）"
-            echo "  -h, --help    显示帮助"
+            echo "  -u, --ultra     直接启用激进模式"
+            echo "  -s, --standard  直接启用标准模式"
+            echo "  -h, --help      显示帮助"
             exit 0
             ;;
         *) shift ;;
     esac
 done
 
-# 需要 root
+# root 检测
 if [[ $EUID -ne 0 ]]; then
     error "请以 root 用户运行"
     exit 1
 fi
 
-#------------ 系统检测 ------------
-detect_system() {
+#------------ 系统与环境检测 ------------
+detect_environment() {
     ARCH=$(uname -m)
     case $ARCH in
         x86_64|amd64)  ARCH_TYPE="x86_64" ;;
         aarch64|arm64) ARCH_TYPE="arm64"  ;;
         *)             ARCH_TYPE="other"  ;;
     esac
+
     KERNEL=$(uname -r)
     CPU_CORES=$(nproc)
     MEM_TOTAL_MB=$(grep MemTotal /proc/meminfo | awk '{print int($2/1024)}')
     DISK_FREE_GB=$(df -BG / | awk 'NR==2 {print int($4)}')
     IFACE=$(ip route get 1 2>/dev/null | awk '{print $5; exit}')
     [[ -z "$IFACE" ]] && IFACE="eth0"
-    AVAILABLE_CC=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)
+
+    # 是否容器
+    CONTAINER="none"
+    if [ -f /.dockerenv ]; then
+        CONTAINER="Docker"
+    elif grep -qE 'docker|libpod' /proc/1/cgroup 2>/dev/null; then
+        CONTAINER="Docker"
+    elif grep -qE 'lxc|0::/' /proc/1/cgroup 2>/dev/null && [ ! -d /sys/fs/cgroup/systemd ]; then
+        CONTAINER="LXC"
+    elif [ -f /proc/vz/veinfo ]; then
+        CONTAINER="OpenVZ"
+    fi
+
+    # 可用拥塞控制
+    AVAILABLE_CC=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "reno")
+    # 是否支持 fq 队列
+    FQ_SUPPORT=0
+    if modprobe sch_fq 2>/dev/null; then
+        FQ_SUPPORT=1
+    elif [ -e /proc/sys/net/core/default_qdisc ] && [ -w /proc/sys/net/core/default_qdisc ]; then
+        # 尝试写入 fq 看看
+        local tmp=$(cat /proc/sys/net/core/default_qdisc)
+        if echo "fq" > /proc/sys/net/core/default_qdisc 2>/dev/null; then
+            FQ_SUPPORT=1
+            echo "$tmp" > /proc/sys/net/core/default_qdisc
+        fi
+    fi
 }
 
 print_header() {
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║               宽带助手                    ║${NC}"
-    echo -e "${CYAN}║                                          ║${NC}"
+    echo -e "${CYAN}║       VPS Network Optimizer               ║${NC}"
+    echo -e "${CYAN}║                                           ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -72,38 +102,77 @@ print_system_info() {
     echo -e "  物理内存    : ${MEM_TOTAL_MB} MB"
     echo -e "  磁盘剩余    : ${DISK_FREE_GB} GB"
     echo -e "  主网卡      : ${IFACE}"
+    echo -e "  虚拟化/容器 : ${CONTAINER}"
     echo -e "  可用拥塞控制: ${AVAILABLE_CC}"
+    if [ $FQ_SUPPORT -eq 1 ]; then
+        echo -e "  fq 队列支持 : 是"
+    else
+        echo -e "  fq 队列支持 : 否（将使用 pfifo_fast）"
+    fi
 }
 
+#------------ 推荐模式 ------------
 recommend_mode() {
     local rec="standard"
-    if [[ $MEM_TOTAL_MB -ge 4096 ]]; then
+    if [[ $MEM_TOTAL_MB -ge 4096 && $CONTAINER == "none" ]]; then
         rec="ultra"
+    elif [[ $MEM_TOTAL_MB -le 256 ]]; then
+        rec="standard"
+        warn "内存极低 (≤256MB)，仅支持保守参数，无法激进"
+    fi
+    if [[ $CONTAINER != "none" ]]; then
+        warn "检测到容器环境，部分优化可能受限（模块加载、qdisc 修改等）"
     fi
     echo ""
-    echo -e "  ${YELLOW}推荐模式: ${rec}${NC}"
-    echo -e "  ${YELLOW}当前模式: ${MODE}${NC}"
-    if [[ "$MODE" == "ultra" && "$MEM_TOTAL_MB" -le 1024 ]]; then
-        warn "当前内存 ≤1G 且选择了激进模式，存在 OOM 风险！"
+    echo -e "  ${YELLOW}智能推荐模式: ${rec}${NC}"
+    if [ -z "$MODE" ]; then
+        echo ""
+        echo "请选择优化模式："
+        echo "  1) 退出 (不执行任何操作)"
+        echo "  2) 标准优化 (安全均衡)"
+        echo "  3) 激进模式 (最大化带宽，可能 OOM)"
     fi
+}
+
+#------------ 读取用户输入 ------------
+read_choice() {
+    if [ -n "$MODE" ]; then
+        return
+    fi
+    local ch
+    if [ -t 0 ]; then
+        read -p "输入数字 [2]: " ch
+    else
+        read -p "输入数字 [2]: " ch < /dev/tty
+    fi
+    ch=${ch:-2}
+    case $ch in
+        1) MODE="exit" ;;
+        2) MODE="standard" ;;
+        3) MODE="ultra" ;;
+        *) warn "无效输入，默认标准模式"; MODE="standard" ;;
+    esac
 }
 
 #------------ 虚拟内存 ------------
 SWAP_FILE="/swapfile"
 setup_swap() {
-    section "配置虚拟内存 (swap)"
+    section "虚拟内存 (swap)"
     local current_swap=$(free -m | awk '/Swap:/ {print $2}')
     local swap_size
-    if   [[ $MEM_TOTAL_MB -le 1024 ]]; then swap_size=2048
+    # 根据内存设定 swap 大小，极端内存给予足够但不过分的 swap
+    if   [[ $MEM_TOTAL_MB -le 128 ]]; then swap_size=256
+    elif [[ $MEM_TOTAL_MB -le 256 ]]; then swap_size=512
+    elif [[ $MEM_TOTAL_MB -le 512 ]]; then swap_size=1024
+    elif [[ $MEM_TOTAL_MB -le 1024 ]]; then swap_size=2048
     elif [[ $MEM_TOTAL_MB -le 2048 ]]; then swap_size=4096
     elif [[ $MEM_TOTAL_MB -le 4096 ]]; then swap_size=6144
     else swap_size=8192
     fi
-    # 激进模式额外增加 1GB
     [[ "$MODE" == "ultra" ]] && swap_size=$(( swap_size + 1024 ))
 
     if [[ $current_swap -ge $swap_size ]]; then
-        info "当前 swap 足够 (${current_swap}MB >= ${swap_size}MB)，无需创建"
+        info "当前 swap 充足 (${current_swap}MB >= ${swap_size}MB)，无需创建"
         return
     fi
     if [[ $DISK_FREE_GB -lt $(( (swap_size + 1023) / 1024 )) ]]; then
@@ -117,28 +186,35 @@ setup_swap() {
     mkswap "$SWAP_FILE" > /dev/null
     swapon "$SWAP_FILE"
     grep -q "$SWAP_FILE" /etc/fstab || echo "$SWAP_FILE none swap sw 0 0" >> /etc/fstab
-    info "swap 创建完成，当前 swap 总量: $(free -m | awk '/Swap:/ {print $2}')MB"
+    info "swap 完成，当前总量: $(free -m | awk '/Swap:/ {print $2}')MB"
 }
 
-#------------ 内核模块 ------------
+#------------ 模块加载与算法选择 ------------
 load_modules() {
-    section "加载内核模块"
-    if modprobe sch_fq 2>/dev/null; then
-        info "sch_fq 加载成功"
-        echo "sch_fq" > /etc/modules-load.d/optimizer-fq.conf
+    section "内核模块与算法选择"
+    # 队列
+    if [ $FQ_SUPPORT -eq 1 ]; then
+        QDISC="fq"
+        info "将使用 fq 队列"
+        echo "sch_fq" > /etc/modules-load.d/optimizer-fq.conf 2>/dev/null || true
     else
-        warn "sch_fq 不可用，net.core.default_qdisc 可能无法切换为 fq"
+        QDISC="pfifo_fast"
+        warn "fq 不可用，使用 pfifo_fast（无队列管理）"
     fi
 
-    if echo "$AVAILABLE_CC" | grep -qw bbrplus; then
-        CC_ALGO="bbrplus"
-        modprobe tcp_bbrplus 2>/dev/null || { CC_ALGO="bbr"; modprobe tcp_bbr; }
-    else
+    # 拥塞控制
+    if echo "$AVAILABLE_CC" | grep -qw bbr; then
         CC_ALGO="bbr"
-        modprobe tcp_bbr 2>/dev/null
+        modprobe tcp_bbr 2>/dev/null || true
+    elif echo "$AVAILABLE_CC" | grep -qw bbrplus; then
+        CC_ALGO="bbrplus"
+        modprobe tcp_bbrplus 2>/dev/null || true
+    else
+        CC_ALGO=$(echo "$AVAILABLE_CC" | awk '{print $1}')
+        warn "BBR 不可用，使用 ${CC_ALGO}"
     fi
-    echo "tcp_${CC_ALGO}" > /etc/modules-load.d/optimizer-cc.conf
-    info "使用拥塞控制: ${CC_ALGO}"
+    echo "tcp_${CC_ALGO}" > /etc/modules-load.d/optimizer-cc.conf 2>/dev/null || true
+    info "拥塞控制: ${CC_ALGO}"
 }
 
 #------------ 生成 sysctl 配置 ------------
@@ -149,68 +225,85 @@ generate_sysctl() {
     local file_max somaxconn backlog syn_backlog tw_buckets max_orphans limit_output notsent_lowat
     local syn_retries_val tcp_retries2_val early_retrans_val
 
-    # 参数表
-    if [[ "$MODE" == "ultra" ]]; then
-        if [[ $mem -le 1024 ]]; then
-            rmem_max=33554432; wmem_max=33554432
-            tcp_rmem="4096 262144 33554432"; tcp_wmem="4096 131072 33554432"
-            tcp_mem="65536 262144 524288"
-            file_max=65536; somaxconn=65535; backlog=32768; syn_backlog=32768
-            tw_buckets=16384; max_orphans=65536; limit_output=0; notsent_lowat=131072
-            syn_retries_val=1; tcp_retries2_val=3; early_retrans_val=3
-        elif [[ $mem -le 4096 ]]; then
-            rmem_max=134217728; wmem_max=134217728
-            tcp_rmem="4096 524288 134217728"; tcp_wmem="4096 262144 134217728"
-            tcp_mem="262144 786432 1572864"
-            file_max=1000000; somaxconn=65535; backlog=65535; syn_backlog=131072
-            tw_buckets=16384; max_orphans=131072; limit_output=0; notsent_lowat=262144
-            syn_retries_val=1; tcp_retries2_val=3; early_retrans_val=3
-        else
-            rmem_max=268435456; wmem_max=268435456
-            tcp_rmem="4096 1048576 268435456"; tcp_wmem="4096 524288 268435456"
-            tcp_mem="1048576 1572864 2097152"
-            file_max=2000000; somaxconn=65535; backlog=262144; syn_backlog=131072
-            tw_buckets=32768; max_orphans=262144; limit_output=0; notsent_lowat=262144
-            syn_retries_val=1; tcp_retries2_val=2; early_retrans_val=3
-        fi
+    # 极端内存分档
+    if [ $mem -le 128 ]; then
+        # 128MB 极限
+        rmem_max=2097152; wmem_max=2097152
+        tcp_rmem="4096 32768 2097152"; tcp_wmem="4096 16384 2097152"
+        tcp_mem="4096 8192 16384"
+        file_max=32768; somaxconn=2048; backlog=1024; syn_backlog=1024
+        tw_buckets=1024; max_orphans=4096; limit_output=65536; notsent_lowat=4096
+        syn_retries_val=3; tcp_retries2_val=8; early_retrans_val=1
+    elif [ $mem -le 256 ]; then
+        rmem_max=4194304; wmem_max=4194304
+        tcp_rmem="4096 65536 4194304"; tcp_wmem="4096 32768 4194304"
+        tcp_mem="8192 16384 32768"
+        file_max=32768; somaxconn=4096; backlog=2048; syn_backlog=2048
+        tw_buckets=2048; max_orphans=8192; limit_output=131072; notsent_lowat=8192
+        syn_retries_val=3; tcp_retries2_val=8; early_retrans_val=1
+    elif [ $mem -le 512 ]; then
+        rmem_max=8388608; wmem_max=8388608
+        tcp_rmem="4096 131072 8388608"; tcp_wmem="4096 65536 8388608"
+        tcp_mem="16384 32768 65536"
+        file_max=65536; somaxconn=8192; backlog=4096; syn_backlog=4096
+        tw_buckets=4096; max_orphans=16384; limit_output=262144; notsent_lowat=16384
+        syn_retries_val=2; tcp_retries2_val=6; early_retrans_val=1
+    elif [[ $mem -le 1024 ]]; then
+        # ≤1GB，标准保守
+        rmem_max=16777216; wmem_max=16777216
+        tcp_rmem="4096 131072 16777216"; tcp_wmem="4096 65536 16777216"
+        tcp_mem="32768 65536 131072"
+        file_max=65536; somaxconn=32768; backlog=16384; syn_backlog=16384
+        tw_buckets=8192; max_orphans=32768; limit_output=262144; notsent_lowat=32768
+        syn_retries_val=2; tcp_retries2_val=5; early_retrans_val=2
+    elif [[ $mem -le 4096 ]]; then
+        rmem_max=67108864; wmem_max=67108864
+        tcp_rmem="4096 262144 67108864"; tcp_wmem="4096 131072 67108864"
+        tcp_mem="131072 262144 524288"
+        file_max=1000000; somaxconn=65535; backlog=65535; syn_backlog=65535
+        tw_buckets=16384; max_orphans=65536; limit_output=0; notsent_lowat=131072
+        syn_retries_val=2; tcp_retries2_val=5; early_retrans_val=2
     else
-        if [[ $mem -le 1024 ]]; then
+        rmem_max=134217728; wmem_max=134217728
+        tcp_rmem="4096 131072 134217728"; tcp_wmem="4096 65536 134217728"
+        tcp_mem="524288 786432 1048576"
+        file_max=2000000; somaxconn=65535; backlog=262144; syn_backlog=131072
+        tw_buckets=32768; max_orphans=131072; limit_output=0; notsent_lowat=131072
+        syn_retries_val=2; tcp_retries2_val=5; early_retrans_val=2
+    fi
+
+    # 激进模式上调参数
+    if [[ "$MODE" == "ultra" ]]; then
+        if [ $mem -ge 1024 ]; then
+            rmem_max=$(( rmem_max * 2 ))
+            wmem_max=$(( wmem_max * 2 ))
+            tcp_rmem="4096 $(( $(echo $tcp_rmem | awk '{print $2}') * 2 )) $rmem_max"
+            tcp_wmem="4096 $(( $(echo $tcp_wmem | awk '{print $2}') * 2 )) $wmem_max"
+            tcp_mem="$(( $(echo $tcp_mem | awk '{print $1}') * 2 )) $(( $(echo $tcp_mem | awk '{print $2}') * 2 )) $(( $(echo $tcp_mem | awk '{print $3}') * 2 ))"
+            syn_retries_val=1; tcp_retries2_val=3; early_retrans_val=3
+            limit_output=0
+        elif [ $mem -ge 512 ]; then
             rmem_max=16777216; wmem_max=16777216
-            tcp_rmem="4096 131072 16777216"; tcp_wmem="4096 65536 16777216"
-            tcp_mem="32768 65536 131072"
-            file_max=65536; somaxconn=32768; backlog=16384; syn_backlog=16384
-            tw_buckets=8192; max_orphans=32768; limit_output=262144; notsent_lowat=32768
-            syn_retries_val=2; tcp_retries2_val=5; early_retrans_val=2
-        elif [[ $mem -le 4096 ]]; then
-            rmem_max=67108864; wmem_max=67108864
-            tcp_rmem="4096 262144 67108864"; tcp_wmem="4096 131072 67108864"
-            tcp_mem="131072 262144 524288"
-            file_max=1000000; somaxconn=65535; backlog=65535; syn_backlog=65535
-            tw_buckets=16384; max_orphans=65536; limit_output=0; notsent_lowat=131072
-            syn_retries_val=2; tcp_retries2_val=5; early_retrans_val=2
-        else
-            rmem_max=134217728; wmem_max=134217728
-            tcp_rmem="4096 131072 134217728"; tcp_wmem="4096 65536 134217728"
-            tcp_mem="524288 786432 1048576"
-            file_max=2000000; somaxconn=65535; backlog=262144; syn_backlog=131072
-            tw_buckets=32768; max_orphans=131072; limit_output=0; notsent_lowat=131072
-            syn_retries_val=2; tcp_retries2_val=5; early_retrans_val=2
+            tcp_rmem="4096 262144 16777216"; tcp_wmem="4096 131072 16777216"
+            tcp_mem="32768 131072 262144"
+            syn_retries_val=1; tcp_retries2_val=4; early_retrans_val=2
         fi
     fi
 
     # 备份
     local bak="/etc/sysctl.conf.bak.$(date +%Y%m%d%H%M%S)"
     cp /etc/sysctl.conf "$bak" 2>/dev/null || true
-    info "备份原有配置: $bak"
+    info "备份配置: $bak"
 
     cat > /etc/sysctl.conf << EOF
-# Generated by VPS Optimizer v2.2
+# Generated by VPS Optimizer v2.3
 # Mode: ${MODE} | Arch: ${ARCH_TYPE} | Cores: ${CPU_CORES} | Mem: ${MEM_TOTAL_MB}MB
+# Container: ${CONTAINER} | Qdisc: ${QDISC}
 # Backup: $bak
 
 fs.file-max = ${file_max}
 
-net.core.default_qdisc = fq
+net.core.default_qdisc = ${QDISC}
 net.ipv4.tcp_congestion_control = ${CC_ALGO}
 net.ipv4.tcp_ecn = 0
 
@@ -259,36 +352,40 @@ net.ipv4.tcp_moderate_rcvbuf = 1
 vm.swappiness = 10
 vm.vfs_cache_pressure = 50
 EOF
-    info "新的 sysctl.conf 写入完成"
+    info "新配置写入完成"
 }
 
 #------------ 应用配置 ------------
 apply_config() {
-    section "应用配置"
-    sysctl -p /etc/sysctl.conf > /dev/null 2>&1 || warn "部分内核限制未能应用（通常无影响）"
-    info "sysctl 已加载"
+    section "应用 sysctl 配置"
+    sysctl -p /etc/sysctl.conf > /dev/null 2>&1 || warn "部分参数因内核限制未生效（可忽略）"
+    info "sysctl 参数已加载"
 
-    if tc qdisc replace dev "$IFACE" root fq 2>/dev/null; then
-        info "网卡 $IFACE 根队列 -> fq"
+    # 网卡队列调整
+    if [ $FQ_SUPPORT -eq 1 ]; then
+        if tc qdisc replace dev "$IFACE" root fq 2>/dev/null; then
+            info "网卡 $IFACE 队列 -> fq"
+        else
+            warn "网卡 fq 设置失败，已使用默认队列"
+        fi
     else
-        warn "网卡 $IFACE fq 设置失败（不影响核心性能）"
+        warn "fq 不支持，网卡队列未修改"
     fi
-    ip link set dev "$IFACE" txqueuelen 10000 2>/dev/null
-    info "网卡发送队列长度调整完成"
+    ip link set dev "$IFACE" txqueuelen 10000 2>/dev/null || true
 }
 
-#------------ 总结 ------------
+#------------ 最终总结 ------------
 final_summary() {
-    section "优化已完成"
+    section "优化完成"
     echo -e "  ${CYAN}拥塞控制  ${NC}: $(sysctl -n net.ipv4.tcp_congestion_control)"
     echo -e "  ${CYAN}默认 Qdisc${NC}: $(sysctl -n net.core.default_qdisc)"
     echo -e "  ${CYAN}ECN       ${NC}: $(sysctl -n net.ipv4.tcp_ecn)"
     echo -e "  ${CYAN}Swap 总量 ${NC}: $(free -m | awk '/Swap:/ {print $2}') MB"
     echo ""
-    info "建议重启代理/转发服务以使新连接生效："
-    echo -e "  ${YELLOW}systemctl restart v2ray${NC} （或其他服务）"
+    info "建议重启代理/转发服务："
+    echo -e "  ${YELLOW}systemctl restart v2ray${NC}"
     echo ""
-    info "如需回滚："
+    info "回滚命令："
     echo -e "  cp /etc/sysctl.conf.bak.* /etc/sysctl.conf && sysctl -p"
     echo ""
 }
@@ -296,9 +393,24 @@ final_summary() {
 #-----------------------------------------------------------------------------
 main() {
     print_header
-    detect_system
+    detect_environment
     print_system_info
     recommend_mode
+
+    # 如果命令行未指定模式，交互询问；否则直接使用
+    if [ -z "$MODE" ]; then
+        read_choice
+    fi
+
+    if [ "$MODE" == "exit" ]; then
+        info "已退出，未修改任何配置。"
+        exit 0
+    fi
+
+    echo ""
+    echo -e "  ${YELLOW}即将以 [${MODE}] 模式执行优化...${NC}"
+    sleep 1
+
     setup_swap
     load_modules
     generate_sysctl
@@ -306,4 +418,4 @@ main() {
     final_summary
 }
 
-main
+main "$@"
