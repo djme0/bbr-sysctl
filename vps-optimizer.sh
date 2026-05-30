@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #=============================================================================
-# VPS Network Optimizer v2.5
-# 智能探测可写参数 · 自动降级 · 容器兼容
+# VPS Network Optimizer v2.6
+# 智能探测 · 容器降级 · 零报错 · 语法修正
 # 用法：
 #   curl -fsSL RAW_URL | sudo bash
 #   curl -fsSL RAW_URL | sudo bash -s -- -u   # 激进模式
@@ -21,7 +21,7 @@ while [[ $# -gt 0 ]]; do
         -u|--ultra) MODE="ultra"; shift ;;
         -s|--standard) MODE="standard"; shift ;;
         -h|--help)
-            echo "VPS Network Optimizer v2.5"
+            echo "VPS Network Optimizer v2.6"
             echo "  -u, --ultra     激进模式"
             echo "  -s, --standard  标准模式"
             exit 0 ;;
@@ -75,7 +75,7 @@ detect_environment() {
 print_header() {
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║       VPS Network Optimizer v2.5          ║${NC}"
+    echo -e "${CYAN}║       VPS Network Optimizer v2.6          ║${NC}"
     echo -e "${CYAN}║   智能探测 · 容器降级 · 零报错            ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
 }
@@ -175,64 +175,57 @@ load_modules() {
 }
 
 #------------ 智能参数探测与应用 ------------
-# 全局数组存储最终要写入的配置
-declare -A FINAL_SYSCTL    # key => value
+declare -A FINAL_SYSCTL
 FAILED_KEYS=()
 
-# 探测一个 sysctl 键是否可写，并尝试设置值（支持 fallback）
+# 安全地将 sysctl 键转换为 /proc/sys 路径
+sysctl_key_to_path() {
+    local key="$1"
+    local path
+    path="${key//./\/}"
+    echo "/proc/sys/${path}"
+}
+
+# 尝试写入 sysctl，失败记录原因
 try_sysctl() {
     local key="$1"
     local val="$2"
-    local fallback="$3"   # 可选：如果失败，用这个值再试
-    local proc_path="/proc/sys/${key//./\}"
+    local proc_path
+    proc_path=$(sysctl_key_to_path "$key")
 
-    # 文件存在？
     if [ ! -e "$proc_path" ]; then
         FAILED_KEYS+=("$key (文件不存在)")
         return 1
     fi
 
-    # 可写？
     if [ ! -w "$proc_path" ]; then
         FAILED_KEYS+=("$key (只读)")
         return 1
     fi
 
-    # 尝试写入
     if echo "$val" > "$proc_path" 2>/dev/null; then
         FINAL_SYSCTL["$key"]="$val"
         return 0
     fi
 
-    # 如果有 fallback，递归尝试
-    if [ -n "$fallback" ]; then
-        warn "$key=$val 失败，尝试 $fallback"
-        if echo "$fallback" > "$proc_path" 2>/dev/null; then
-            FINAL_SYSCTL["$key"]="$fallback"
-            return 0
-        fi
-    fi
-
-    # 彻底失败
-    FAILED_KEYS+=("$key (值无效或权限不足)")
+    FAILED_KEYS+=("$key (值无效)")
     return 1
 }
 
-# 尝试 rmem_max/wmem_max，自动探测上限
+# 尝试写入缓冲区最大值（自动降级）
 try_buffer_max() {
     local key="$1"
     local desired="$2"
-    local proc_path="/proc/sys/${key//./\}"
+    local proc_path
+    proc_path=$(sysctl_key_to_path "$key")
 
     [ ! -e "$proc_path" ] && { FAILED_KEYS+=("$key (不存在)"); return 1; }
     [ ! -w "$proc_path" ] && { FAILED_KEYS+=("$key (只读)"); return 1; }
 
-    # 二分法探测上限：从 desired 开始，失败则减半，直到成功
     local val=$desired
     while [ $val -ge 4096 ]; do
         if echo "$val" > "$proc_path" 2>/dev/null; then
             FINAL_SYSCTL["$key"]="$val"
-            info "$key = $val (探测成功)"
             return 0
         fi
         val=$(( val / 2 ))
@@ -244,13 +237,13 @@ try_buffer_max() {
 apply_all_params() {
     section "参数探测与应用"
 
-    # 先设置拥塞控制（可能已可用）
+    # 拥塞控制
     try_sysctl "net.ipv4.tcp_congestion_control" "$CC_ALGO"
     try_sysctl "net.ipv4.tcp_ecn" "0"
 
-    # 缓冲区
-    local rmax wmax rmem wmem tcp_mem_val
     local mem=$MEM_TOTAL_MB
+    local rmax wmax
+    local -a rmem_arr wmem_arr tcp_mem_arr
     local syn_retries_val=2 tcp_retries2_val=5 early_retrans_val=2
     local limit_output=0 notsent_lowat=131072
     local file_max=65536 somaxconn=32768 backlog=16384 syn_backlog=16384
@@ -259,67 +252,67 @@ apply_all_params() {
     # 根据内存计算理想值
     if [ $mem -le 128 ]; then
         rmax=2097152; wmax=2097152
-        rmem="4096 32768 2097152"; wmem="4096 16384 2097152"
-        tcp_mem_val="4096 8192 16384"
+        rmem_arr=(4096 32768 2097152); wmem_arr=(4096 16384 2097152)
+        tcp_mem_arr=(4096 8192 16384)
         file_max=32768; somaxconn=2048; backlog=1024; syn_backlog=1024
         tw_buckets=1024; max_orphans=4096; limit_output=65536; notsent_lowat=4096
         syn_retries_val=3; tcp_retries2_val=8; early_retrans_val=1
     elif [ $mem -le 256 ]; then
         rmax=4194304; wmax=4194304
-        rmem="4096 65536 4194304"; wmem="4096 32768 4194304"
-        tcp_mem_val="8192 16384 32768"
+        rmem_arr=(4096 65536 4194304); wmem_arr=(4096 32768 4194304)
+        tcp_mem_arr=(8192 16384 32768)
         file_max=32768; somaxconn=4096; backlog=2048; syn_backlog=2048
         tw_buckets=2048; max_orphans=8192; limit_output=131072; notsent_lowat=8192
         syn_retries_val=3; tcp_retries2_val=8; early_retrans_val=1
     elif [ $mem -le 512 ]; then
         rmax=8388608; wmax=8388608
-        rmem="4096 131072 8388608"; wmem="4096 65536 8388608"
-        tcp_mem_val="16384 32768 65536"
+        rmem_arr=(4096 131072 8388608); wmem_arr=(4096 65536 8388608)
+        tcp_mem_arr=(16384 32768 65536)
         file_max=65536; somaxconn=8192; backlog=4096; syn_backlog=4096
         tw_buckets=4096; max_orphans=16384; limit_output=262144; notsent_lowat=16384
         syn_retries_val=2; tcp_retries2_val=6; early_retrans_val=1
     elif [ $mem -le 1024 ]; then
         rmax=16777216; wmax=16777216
-        rmem="4096 131072 16777216"; wmem="4096 65536 16777216"
-        tcp_mem_val="32768 65536 131072"
+        rmem_arr=(4096 131072 16777216); wmem_arr=(4096 65536 16777216)
+        tcp_mem_arr=(32768 65536 131072)
         file_max=65536; somaxconn=32768; backlog=16384; syn_backlog=16384
         tw_buckets=8192; max_orphans=32768; limit_output=262144; notsent_lowat=32768
         syn_retries_val=2; tcp_retries2_val=5; early_retrans_val=2
     elif [ $mem -le 4096 ]; then
         rmax=67108864; wmax=67108864
-        rmem="4096 262144 67108864"; wmem="4096 131072 67108864"
-        tcp_mem_val="131072 262144 524288"
+        rmem_arr=(4096 262144 67108864); wmem_arr=(4096 131072 67108864)
+        tcp_mem_arr=(131072 262144 524288)
         file_max=1000000; somaxconn=65535; backlog=65535; syn_backlog=65535
         tw_buckets=16384; max_orphans=65536; limit_output=0; notsent_lowat=131072
         syn_retries_val=2; tcp_retries2_val=5; early_retrans_val=2
     else
         rmax=134217728; wmax=134217728
-        rmem="4096 131072 134217728"; wmem="4096 65536 134217728"
-        tcp_mem_val="524288 786432 1048576"
+        rmem_arr=(4096 131072 134217728); wmem_arr=(4096 65536 134217728)
+        tcp_mem_arr=(524288 786432 1048576)
         file_max=2000000; somaxconn=65535; backlog=262144; syn_backlog=131072
         tw_buckets=32768; max_orphans=131072; limit_output=0; notsent_lowat=131072
         syn_retries_val=2; tcp_retries2_val=5; early_retrans_val=2
     fi
 
-    # 激进模式上调
-    if [ "$MODE" == "ultra" ]; then
-        if [ $mem -ge 1024 ]; then
-            rmax=$(( rmax * 2 )); wmax=$(( wmax * 2 ))
-            rmem="4096 $(( $(echo $rmem | awk '{print $2}') * 2 )) $rmax"
-            wmem="4096 $(( $(echo $wmem | awk '{print $2}') * 2 )) $wmax"
-            tcp_mem_val="$(( $(echo $tcp_mem_val | awk '{print $1}') * 2 )) $(( $(echo $tcp_mem_val | awk '{print $2}') * 2 )) $(( $(echo $tcp_mem_val | awk '{print $3}') * 2 ))"
-            syn_retries_val=1; tcp_retries2_val=3; early_retrans_val=3
-        fi
+    # 激进上调
+    if [ "$MODE" == "ultra" ] && [ $mem -ge 1024 ]; then
+        rmax=$(( rmax * 2 )); wmax=$(( wmax * 2 ))
+        rmem_arr[1]=$(( rmem_arr[1] * 2 )); rmem_arr[2]=$rmax
+        wmem_arr[1]=$(( wmem_arr[1] * 2 )); wmem_arr[2]=$wmax
+        tcp_mem_arr[0]=$(( tcp_mem_arr[0] * 2 )); tcp_mem_arr[1]=$(( tcp_mem_arr[1] * 2 ))
+        tcp_mem_arr[2]=$(( tcp_mem_arr[2] * 2 ))
+        syn_retries_val=1; tcp_retries2_val=3; early_retrans_val=3
     fi
 
-    # 逐个尝试设置
     try_buffer_max "net.core.rmem_max" $rmax
     try_buffer_max "net.core.wmem_max" $wmax
-    try_sysctl "net.ipv4.tcp_rmem" "$rmem"
-    try_sysctl "net.ipv4.tcp_wmem" "$wmem"
-    try_sysctl "net.ipv4.tcp_mem" "$tcp_mem_val" "$tcp_mem_val"  # will fail if missing
+    try_sysctl "net.ipv4.tcp_rmem" "${rmem_arr[0]} ${rmem_arr[1]} ${rmem_arr[2]}"
+    try_sysctl "net.ipv4.tcp_wmem" "${wmem_arr[0]} ${wmem_arr[1]} ${wmem_arr[2]}"
+    try_sysctl "net.ipv4.tcp_mem" "${tcp_mem_arr[0]} ${tcp_mem_arr[1]} ${tcp_mem_arr[2]}"
     try_sysctl "net.ipv4.tcp_limit_output_bytes" "$limit_output"
     try_sysctl "net.ipv4.tcp_notsent_lowat" "$notsent_lowat"
+
+    # 布尔/小参数
     try_sysctl "net.ipv4.tcp_window_scaling" "1"
     try_sysctl "net.ipv4.tcp_adv_win_scale" "1"
     try_sysctl "net.ipv4.tcp_slow_start_after_idle" "0"
@@ -351,20 +344,19 @@ apply_all_params() {
     try_sysctl "vm.swappiness" "10"
     try_sysctl "vm.vfs_cache_pressure" "50"
 
-    # 生成精简版 sysctl.conf（只包含成功项）
+    # 生成精简配置
     local bak="/etc/sysctl.conf.bak.$(date +%Y%m%d%H%M%S)"
     cp /etc/sysctl.conf "$bak" 2>/dev/null || true
     info "备份: $bak"
 
-    cat > /etc/sysctl.conf << EOF
-# Generated by VPS Optimizer v2.5
-# Mode: ${MODE} | Arch: ${ARCH_TYPE} | Cores: ${CPU_CORES} | Mem: ${MEM_TOTAL_MB}MB
-# Backup: $bak
-# Only successfully applied parameters are listed.
-EOF
-    for key in "${!FINAL_SYSCTL[@]}"; do
-        echo "$key = ${FINAL_SYSCTL[$key]}" >> /etc/sysctl.conf
-    done
+    {
+        echo "# Generated by VPS Optimizer v2.6"
+        echo "# Mode: ${MODE} | Arch: ${ARCH_TYPE} | Cores: ${CPU_CORES} | Mem: ${MEM_TOTAL_MB}MB"
+        echo "# Backup: $bak"
+        for key in $(printf '%s\n' "${!FINAL_SYSCTL[@]}" | sort); do
+            echo "$key = ${FINAL_SYSCTL[$key]}"
+        done
+    } > /etc/sysctl.conf
 
     # 网卡队列
     if [ $FQ_SUPPORT -eq 1 ]; then
@@ -377,16 +369,14 @@ EOF
 final_summary() {
     section "优化结果汇总"
     echo ""
-    # 成功项
-    echo -e "  ${GREEN}成功应用的参数 (${#FINAL_SYSCTL[@]} 项):${NC}"
-    for key in $(echo "${!FINAL_SYSCTL[@]}" | tr ' ' '\n' | sort); do
+    echo -e "  ${GREEN}成功应用 (${#FINAL_SYSCTL[@]} 项):${NC}"
+    for key in $(printf '%s\n' "${!FINAL_SYSCTL[@]}" | sort); do
         echo -e "    ${key} = ${FINAL_SYSCTL[$key]}"
     done
 
-    # 失败项
     if [ ${#FAILED_KEYS[@]} -gt 0 ]; then
         echo ""
-        echo -e "  ${RED}无法应用的参数 (${#FAILED_KEYS[@]} 项):${NC}"
+        echo -e "  ${RED}无法应用 (${#FAILED_KEYS[@]} 项):${NC}"
         for msg in "${FAILED_KEYS[@]}"; do
             echo -e "    - $msg"
         done
@@ -394,7 +384,9 @@ final_summary() {
 
     echo ""
     info "建议重启代理服务: systemctl restart v2ray"
-    info "回滚: cp $bak /etc/sysctl.conf && sysctl -p"
+    local bak
+    bak=$(ls -t /etc/sysctl.conf.bak.* 2>/dev/null | head -1)
+    [ -n "$bak" ] && info "回滚: cp $bak /etc/sysctl.conf && sysctl -p"
 }
 
 #-----------------------------------------------------------------------------
