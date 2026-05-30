@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #=============================================================================
-# VPS Network Optimizer v2.3
-# 简洁交互 · 极端内存支持 · 容器/OpenVZ/LXC 自动降级
+# VPS Network Optimizer v2.4
+# 简洁交互 · 极端内存 · 容器自动降级 · swap 容错
 # 用法：
 #   curl -fsSL RAW_URL | sudo bash            # 标准菜单
 #   curl -fsSL RAW_URL | sudo bash -s -- -u   # 直接激进模式
@@ -24,7 +24,7 @@ while [[ $# -gt 0 ]]; do
         -u|--ultra) MODE="ultra"; shift ;;
         -s|--standard) MODE="standard"; shift ;;
         -h|--help)
-            echo "VPS Network Optimizer v2.3"
+            echo "VPS Network Optimizer v2.4"
             echo "用法: $0 [选项]"
             echo "  -u, --ultra     直接启用激进模式"
             echo "  -s, --standard  直接启用标准模式"
@@ -57,16 +57,26 @@ detect_environment() {
     IFACE=$(ip route get 1 2>/dev/null | awk '{print $5; exit}')
     [[ -z "$IFACE" ]] && IFACE="eth0"
 
-    # 是否容器
+    # 容器检测
     CONTAINER="none"
+    CAN_SWAP=1
     if [ -f /.dockerenv ]; then
         CONTAINER="Docker"
+        CAN_SWAP=0
     elif grep -qE 'docker|libpod' /proc/1/cgroup 2>/dev/null; then
         CONTAINER="Docker"
+        CAN_SWAP=0
     elif grep -qE 'lxc|0::/' /proc/1/cgroup 2>/dev/null && [ ! -d /sys/fs/cgroup/systemd ]; then
         CONTAINER="LXC"
+        CAN_SWAP=0
     elif [ -f /proc/vz/veinfo ]; then
         CONTAINER="OpenVZ"
+        CAN_SWAP=0
+    fi
+
+    # 如果/proc/swaps已经存在有效swap，允许使用（虽然罕见）
+    if grep -q '^/' /proc/swaps 2>/dev/null; then
+        CAN_SWAP=1
     fi
 
     # 可用拥塞控制
@@ -76,7 +86,6 @@ detect_environment() {
     if modprobe sch_fq 2>/dev/null; then
         FQ_SUPPORT=1
     elif [ -e /proc/sys/net/core/default_qdisc ] && [ -w /proc/sys/net/core/default_qdisc ]; then
-        # 尝试写入 fq 看看
         local tmp=$(cat /proc/sys/net/core/default_qdisc)
         if echo "fq" > /proc/sys/net/core/default_qdisc 2>/dev/null; then
             FQ_SUPPORT=1
@@ -88,8 +97,8 @@ detect_environment() {
 print_header() {
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║       VPS Network Optimizer               ║${NC}"
-    echo -e "${CYAN}║                                           ║${NC}"
+    echo -e "${CYAN}║       VPS Network Optimizer v2.4          ║${NC}"
+    echo -e "${CYAN}║   简洁交互 · 极端内存 · 容器自动降级     ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -109,6 +118,11 @@ print_system_info() {
     else
         echo -e "  fq 队列支持 : 否（将使用 pfifo_fast）"
     fi
+    if [ $CAN_SWAP -eq 0 ]; then
+        echo -e "  swap 支持   : 否（容器环境，跳过）"
+    else
+        echo -e "  swap 支持   : 是"
+    fi
 }
 
 #------------ 推荐模式 ------------
@@ -121,7 +135,7 @@ recommend_mode() {
         warn "内存极低 (≤256MB)，仅支持保守参数，无法激进"
     fi
     if [[ $CONTAINER != "none" ]]; then
-        warn "检测到容器环境，部分优化可能受限（模块加载、qdisc 修改等）"
+        warn "检测到容器环境，部分优化可能受限（swap、模块、qdisc 等）"
     fi
     echo ""
     echo -e "  ${YELLOW}智能推荐模式: ${rec}${NC}"
@@ -154,13 +168,18 @@ read_choice() {
     esac
 }
 
-#------------ 虚拟内存 ------------
+#------------ 虚拟内存（带容错） ------------
 SWAP_FILE="/swapfile"
 setup_swap() {
     section "虚拟内存 (swap)"
+    if [ $CAN_SWAP -eq 0 ]; then
+        warn "当前环境不支持 swap，跳过"
+        return
+    fi
+
     local current_swap=$(free -m | awk '/Swap:/ {print $2}')
     local swap_size
-    # 根据内存设定 swap 大小，极端内存给予足够但不过分的 swap
+    # 根据内存设定 swap 大小
     if   [[ $MEM_TOTAL_MB -le 128 ]]; then swap_size=256
     elif [[ $MEM_TOTAL_MB -le 256 ]]; then swap_size=512
     elif [[ $MEM_TOTAL_MB -le 512 ]]; then swap_size=1024
@@ -179,14 +198,35 @@ setup_swap() {
         swap_size=$(( DISK_FREE_GB * 1024 - 512 ))
         [[ $swap_size -le 128 ]] && { warn "磁盘空间太小，跳过 swap"; return; }
     fi
-    info "创建 ${swap_size}MB swap 文件..."
-    [[ -f "$SWAP_FILE" ]] && swapoff "$SWAP_FILE" && rm -f "$SWAP_FILE"
-    fallocate -l ${swap_size}M "$SWAP_FILE" 2>/dev/null || dd if=/dev/zero of="$SWAP_FILE" bs=1M count=$swap_size status=none
+
+    info "尝试创建 ${swap_size}MB swap 文件 ..."
+    # 清理旧文件
+    if [ -f "$SWAP_FILE" ]; then
+        swapoff "$SWAP_FILE" 2>/dev/null || true
+        rm -f "$SWAP_FILE"
+    fi
+
+    # 创建文件（fallocate 不可用则用 dd）
+    if ! fallocate -l ${swap_size}M "$SWAP_FILE" 2>/dev/null; then
+        warn "fallocate 失败，使用 dd 创建（可能较慢）"
+        dd if=/dev/zero of="$SWAP_FILE" bs=1M count=$swap_size status=none || {
+            error "swap 文件创建失败，跳过"
+            rm -f "$SWAP_FILE"
+            return
+        }
+    fi
+
     chmod 600 "$SWAP_FILE"
-    mkswap "$SWAP_FILE" > /dev/null
-    swapon "$SWAP_FILE"
-    grep -q "$SWAP_FILE" /etc/fstab || echo "$SWAP_FILE none swap sw 0 0" >> /etc/fstab
-    info "swap 完成，当前总量: $(free -m | awk '/Swap:/ {print $2}')MB"
+    mkswap "$SWAP_FILE" > /dev/null || { error "mkswap 失败，跳过"; rm -f "$SWAP_FILE"; return; }
+
+    # 尝试启用 swap，失败则清理
+    if swapon "$SWAP_FILE" 2>/dev/null; then
+        info "swap 创建成功，当前总量: $(free -m | awk '/Swap:/ {print $2}')MB"
+        grep -q "$SWAP_FILE" /etc/fstab || echo "$SWAP_FILE none swap sw 0 0" >> /etc/fstab
+    else
+        warn "swapon 失败（环境可能不支持），清理并跳过 swap"
+        rm -f "$SWAP_FILE"
+    fi
 }
 
 #------------ 模块加载与算法选择 ------------
@@ -227,7 +267,6 @@ generate_sysctl() {
 
     # 极端内存分档
     if [ $mem -le 128 ]; then
-        # 128MB 极限
         rmem_max=2097152; wmem_max=2097152
         tcp_rmem="4096 32768 2097152"; tcp_wmem="4096 16384 2097152"
         tcp_mem="4096 8192 16384"
@@ -249,7 +288,6 @@ generate_sysctl() {
         tw_buckets=4096; max_orphans=16384; limit_output=262144; notsent_lowat=16384
         syn_retries_val=2; tcp_retries2_val=6; early_retrans_val=1
     elif [[ $mem -le 1024 ]]; then
-        # ≤1GB，标准保守
         rmem_max=16777216; wmem_max=16777216
         tcp_rmem="4096 131072 16777216"; tcp_wmem="4096 65536 16777216"
         tcp_mem="32768 65536 131072"
@@ -296,7 +334,7 @@ generate_sysctl() {
     info "备份配置: $bak"
 
     cat > /etc/sysctl.conf << EOF
-# Generated by VPS Optimizer v2.3
+# Generated by VPS Optimizer v2.4
 # Mode: ${MODE} | Arch: ${ARCH_TYPE} | Cores: ${CPU_CORES} | Mem: ${MEM_TOTAL_MB}MB
 # Container: ${CONTAINER} | Qdisc: ${QDISC}
 # Backup: $bak
