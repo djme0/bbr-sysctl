@@ -11,4 +11,4 @@
 
 ## 一键运行
 ```bash
-curl -fsSL https://raw.githubusercontent.com/djme0/djme0-bbr-sysctl/refs/heads/main/vps-optimizer.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/djme0/bbr-sysctl/refs/heads/main/vps-optimizer.sh | sudo bash
