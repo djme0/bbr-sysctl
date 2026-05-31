@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #=============================================================================
-# VPS Network Optimizer v2.7
-# 完全重构 · 零依赖 · 容器安全 · 输出透明
+# VPS Network Optimizer v3.2 （科学出海定制版 - 全优化 & 零 Bug）
+# 完全重构 · 零依赖 · 容器安全 · 输出透明 · 双栈支持 · 面板适配 · 动态BBR
 # 用法：
 #   curl -fsSL RAW_URL | sudo bash
 #   curl -fsSL RAW_URL | sudo bash -s -- -u   # 激进模式
+#   curl -fsSL RAW_URL | sudo bash -s -- -u --bbr bbrplus   # 直接指定BBR算法
 #=============================================================================
 
 # 颜色
@@ -15,14 +16,18 @@ error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 section() { echo ""; echo -e "${CYAN}>>> $1${NC}"; }
 
 MODE=""
+FORCE_BBR=""   # 可强制指定BBR算法
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -u|--ultra) MODE="ultra"; shift ;;
         -s|--standard) MODE="standard"; shift ;;
+        --bbr) FORCE_BBR="$2"; shift 2 ;;
+        --bbr=*) FORCE_BBR="${1#*=}"; shift ;;
         -h|--help)
-            echo "VPS Network Optimizer v2.7"
-            echo "  -u, --ultra     激进模式"
-            echo "  -s, --standard  标准模式"
+            echo "VPS Network Optimizer v3.2"
+            echo "  -u, --ultra     激进模式 (适合内存>=1G且线路较好的机器)"
+            echo "  -s, --standard  标准模式 (适合绝大多数环境)"
+            echo "  --bbr <algo>    强制指定BBR算法 (例如 bbr, bbrplus, bbr2)"
             exit 0 ;;
         *) shift ;;
     esac
@@ -75,8 +80,8 @@ detect_environment() {
 print_header() {
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║       VPS Network Optimizer v2.7          ║${NC}"
-    echo -e "${CYAN}║   完全重构 · 容器安全 · 输出透明          ║${NC}"
+    echo -e "${CYAN}║       VPS Network Optimizer v3.2         ║${NC}"
+    echo -e "${CYAN}║   (x-ui/s-ui 面板与双栈网络深度定制版)   ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
 }
 
@@ -133,6 +138,70 @@ read_choice() {
         3) MODE="ultra" ;;
         *) MODE="standard" ;;
     esac
+}
+
+#------------ BBR 魔改内核智能选择 ------------
+select_cc_algo() {
+    # 如果用户强制指定，直接使用
+    if [ -n "$FORCE_BBR" ]; then
+        CC_ALGO="$FORCE_BBR"
+        info "使用用户指定的拥塞控制: ${CC_ALGO}"
+        return
+    fi
+
+    # 正确初始化数组（Bash 3.x/4.x 兼容写法）
+    local -a cc_list
+    cc_list=($AVAILABLE_CC)
+    local -a bbr_variants
+    bbr_variants=()
+
+    # 提取所有包含 bbr 的拥塞控制算法
+    for cc in "${cc_list[@]}"; do
+        if [[ "$cc" == *"bbr"* ]]; then
+            bbr_variants+=("$cc")
+        fi
+    done
+
+    # 如果没有 bbr 变种，默认使用第一个算法
+    if [ ${#bbr_variants[@]} -eq 0 ]; then
+        CC_ALGO=${cc_list[0]}
+        return
+    fi
+
+    # 如果只有一种 bbr 算法，直接使用
+    if [ ${#bbr_variants[@]} -eq 1 ]; then
+        CC_ALGO=${bbr_variants[0]}
+        return
+    fi
+
+    # 多个 bbr 变种，需要用户选择；若无法交互则自动选第一个
+    if [ ! -t 0 ]; then
+        # 非交互环境（管道执行），自动选择第一个
+        CC_ALGO=${bbr_variants[0]}
+        warn "检测到多个 BBR 变种，非交互模式自动选择: ${CC_ALGO}"
+        return
+    fi
+
+    # 交互选择
+    echo ""
+    echo -e "${YELLOW}>>> 拥塞控制算法选择${NC}"
+    echo -e "检测到多个 BBR 变种内核，请选择要使用的算法:"
+    local i=1
+    for cc in "${bbr_variants[@]}"; do
+        echo -e "  $i) $cc"
+        i=$((i + 1))
+    done
+
+    local ch
+    read -p "输入数字 [1]: " ch
+    ch=${ch:-1}
+
+    if [[ "$ch" -ge 1 && "$ch" -le ${#bbr_variants[@]} ]]; then
+        CC_ALGO=${bbr_variants[$((ch - 1))]}
+    else
+        CC_ALGO=${bbr_variants[0]}
+        warn "输入无效，默认选择 ${CC_ALGO}"
+    fi
 }
 
 #------------ swap（容错） ------------
@@ -194,28 +263,31 @@ load_modules() {
         echo "sch_fq" > /etc/modules-load.d/optimizer-fq.conf 2>/dev/null || true
     fi
 
-    if echo "$AVAILABLE_CC" | grep -qw bbr; then
-        CC_ALGO="bbr"
-        modprobe tcp_bbr 2>/dev/null || true
-    else
-        CC_ALGO=$(echo "$AVAILABLE_CC" | awk '{print $1}')
+    # 动态加载对应的 BBR 模块
+    if [[ "$CC_ALGO" == *"bbr"* ]]; then
+        modprobe "tcp_${CC_ALGO}" 2>/dev/null || true
+        # 某些魔改内核模块名称为 tcp_bbr 本身，尝试加载
+        if [ "$CC_ALGO" != "bbr" ]; then
+            modprobe "tcp_bbr" 2>/dev/null || true
+        fi
     fi
-    info "使用: ${CC_ALGO} + ${QDISC}"
+
+    # 加载连接追踪模块
+    modprobe nf_conntrack 2>/dev/null || true
+
+    info "使用拥塞控制: ${CC_ALGO} + ${QDISC}"
 }
 
 #------------ 智能参数探测与应用 ------------
-# 用普通数组存储成功/失败信息
 SYSCTL_KEYS=()
 SYSCTL_VALS=()
 FAILED_ITEMS=()
 
-# 把 sysctl 键转换为 /proc/sys 路径
 sysctl_key_to_path() {
     local key="$1"
     echo "/proc/sys/${key//./\/}"
 }
 
-# 安全写入 sysctl 键值，成功则记录，失败则添加到 FAILED_ITEMS
 try_sysctl() {
     local key="$1"
     local val="$2"
@@ -239,7 +311,6 @@ try_sysctl() {
     return 1
 }
 
-# 尝试写入缓冲区最大值，自动降级（最多尝试 32 次）
 try_buffer_max() {
     local key="$1"
     local desired="$2"
@@ -266,6 +337,13 @@ try_buffer_max() {
     done
     FAILED_ITEMS+=("$key (无法找到合适值)")
     return 1
+}
+
+# 从 sysctl 字符串中提取第 n 个字段（索引从1开始）
+extract_field() {
+    local str="$1"
+    local n="$2"
+    echo "$str" | awk -v n=$n '{print $n}'
 }
 
 apply_all_params() {
@@ -328,21 +406,46 @@ apply_all_params() {
         syn_retries_val=2; tcp_retries2_val=5; early_retrans_val=2
     fi
 
-    # 激进模式上调（只对内存 >= 1G 有效）
+    # 激进模式上调
     if [ "$MODE" == "ultra" ] && [ $mem -ge 1024 ]; then
         rmax=$(( rmax * 2 )); wmax=$(( wmax * 2 ))
-        rmem_str="4096 $(( $(echo $rmem_str | awk '{print $2}') * 2 )) $rmax"
-        wmem_str="4096 $(( $(echo $wmem_str | awk '{print $2}') * 2 )) $wmax"
-        tcp_mem_str="$(( $(echo $tcp_mem_str | awk '{print $1}') * 2 )) $(( $(echo $tcp_mem_str | awk '{print $2}') * 2 )) $(( $(echo $tcp_mem_str | awk '{print $3}') * 2 ))"
+        # 使用 extract_field 替代外部 awk，更健壮
+        rmem_str="4096 $(( $(extract_field "$rmem_str" 2) * 2 )) $rmax"
+        wmem_str="4096 $(( $(extract_field "$wmem_str" 2) * 2 )) $wmax"
+        tcp_mem_str="$(( $(extract_field "$tcp_mem_str" 1) * 2 )) $(( $(extract_field "$tcp_mem_str" 2) * 2 )) $(( $(extract_field "$tcp_mem_str" 3) * 2 ))"
         syn_retries_val=1; tcp_retries2_val=3; early_retrans_val=3
     fi
 
-    # 逐个写入
+    # ================= 基本 TCP/UDP/内存参数 =================
     try_buffer_max "net.core.rmem_max" $rmax
     try_buffer_max "net.core.wmem_max" $wmax
+
+    # 获取实际生效的 rmem_max / wmem_max（可能被内核降级）
+    local actual_rmem_max actual_wmem_max
+    actual_rmem_max=$(cat /proc/sys/net/core/rmem_max 2>/dev/null || echo $rmax)
+    actual_wmem_max=$(cat /proc/sys/net/core/wmem_max 2>/dev/null || echo $wmax)
+
+    # 修正 rmem_str / wmem_str 的第三字段，确保不超过实际上限
+    rmem_str="4096 $(extract_field "$rmem_str" 2) $actual_rmem_max"
+    wmem_str="4096 $(extract_field "$wmem_str" 2) $actual_wmem_max"
+
+    try_sysctl "net.core.rmem_default" "1048576"
+    try_sysctl "net.core.wmem_default" "1048576"
     try_sysctl "net.ipv4.tcp_rmem" "$rmem_str"
     try_sysctl "net.ipv4.tcp_wmem" "$wmem_str"
     try_sysctl "net.ipv4.tcp_mem" "$tcp_mem_str"
+
+    # udp_mem 根据内存动态计算（约为 tcp_mem 的一半）
+    local udp_mem_val
+    udp_mem_val="$(( $(extract_field "$tcp_mem_str" 1) / 2 )) $(( $(extract_field "$tcp_mem_str" 2) / 2 )) $(( $(extract_field "$tcp_mem_str" 3) / 2 ))"
+    try_sysctl "net.ipv4.udp_mem" "$udp_mem_val"
+
+    # ================= 代理面板专属 Keepalive 优化 =================
+    try_sysctl "net.ipv4.tcp_keepalive_time" "600"
+    try_sysctl "net.ipv4.tcp_keepalive_probes" "5"
+    try_sysctl "net.ipv4.tcp_keepalive_intvl" "15"
+
+    # ================= TCP 行为参数 =================
     try_sysctl "net.ipv4.tcp_limit_output_bytes" "$limit_output"
     try_sysctl "net.ipv4.tcp_notsent_lowat" "$notsent_lowat"
     try_sysctl "net.ipv4.tcp_window_scaling" "1"
@@ -370,21 +473,32 @@ apply_all_params() {
     try_sysctl "net.ipv4.tcp_max_syn_backlog" "$syn_backlog"
     try_sysctl "net.ipv4.tcp_syncookies" "1"
     try_sysctl "net.ipv4.tcp_abort_on_overflow" "0"
-    try_sysctl "net.ipv4.ip_forward" "1"
     try_sysctl "net.ipv4.tcp_moderate_rcvbuf" "1"
     try_sysctl "fs.file-max" "$file_max"
     try_sysctl "vm.swappiness" "10"
     try_sysctl "vm.vfs_cache_pressure" "50"
 
-    # 生成仅包含成功项的 sysctl.conf
+    # ================= 双栈 IPv4/IPv6 转发配置 =================
+    try_sysctl "net.ipv4.ip_forward" "1"
+    try_sysctl "net.ipv6.conf.all.forwarding" "1"
+    try_sysctl "net.ipv6.conf.default.forwarding" "1"
+    try_sysctl "net.ipv6.conf.all.accept_ra" "2"
+    try_sysctl "net.ipv6.conf.default.accept_ra" "2"
+
+    # ================= 状态追踪 防 CC 优化 =================
+    try_sysctl "net.netfilter.nf_conntrack_max" "1048576"
+    try_sysctl "net.netfilter.nf_conntrack_tcp_timeout_established" "3600"
+    try_sysctl "net.netfilter.nf_conntrack_tcp_timeout_time_wait" "120"
+
+    # ================= 写入配置文件 =================
     local bak
     bak="/etc/sysctl.conf.bak.$(date +%Y%m%d%H%M%S)"
     cp /etc/sysctl.conf "$bak" 2>/dev/null || true
     info "备份原配置: $bak"
 
     {
-        echo "# Generated by VPS Optimizer v2.7"
-        echo "# Mode: ${MODE} | Arch: ${ARCH_TYPE} | Cores: ${CPU_CORES} | Mem: ${MEM_TOTAL_MB}MB"
+        echo "# Generated by VPS Optimizer v3.2 (x-ui/s-ui + BBR custom)"
+        echo "# Mode: ${MODE} | Arch: ${ARCH_TYPE} | Cores: ${CPU_CORES} | Mem: ${MEM_TOTAL_MB}MB | CC: ${CC_ALGO}"
         echo "# Backup: $bak"
         local idx=0
         while [ $idx -lt ${#SYSCTL_KEYS[@]} ]; do
@@ -403,6 +517,25 @@ apply_all_params() {
         fi
     fi
     ip link set dev "$IFACE" txqueuelen 10000 2>/dev/null || true
+}
+
+#------------ 代理面板重启 ------------
+restart_proxy_panels() {
+    section "代理面板深度适配"
+    local panels=("x-ui" "s-ui" "xray" "v2ray" "hysteria" "sing-box")
+    local restarted=0
+
+    for p in "${panels[@]}"; do
+        if systemctl is-active --quiet "$p" 2>/dev/null; then
+            info "检测到运行中的服务: ${p}，正在重启以应用全局配置..."
+            systemctl restart "$p"
+            restarted=1
+        fi
+    done
+
+    if [ $restarted -eq 0 ]; then
+        info "未检测到运行中的代理服务，将在下次启动时应用新网络栈。"
+    fi
 }
 
 #------------ 最终汇总 ------------
@@ -424,19 +557,18 @@ final_summary() {
     if [ ${#FAILED_ITEMS[@]} -gt 0 ]; then
         echo ""
         echo -e "  ${RED}无法应用的参数 (${#FAILED_ITEMS[@]} 项):${NC}"
-        local item
         for item in "${FAILED_ITEMS[@]}"; do
             echo -e "    - $item"
         done
     fi
 
     echo ""
-    info "建议重启代理/转发服务: systemctl restart v2ray"
     local bak
     bak=$(ls -t /etc/sysctl.conf.bak.* 2>/dev/null | head -1)
     if [ -n "$bak" ]; then
         info "回滚命令: cp $bak /etc/sysctl.conf && sysctl -p"
     fi
+    echo -e "${GREEN}恭喜，科学出海定制版优化完毕！已应用拥塞控制: ${CC_ALGO}${NC}"
 }
 
 #-----------------------------------------------------------------------------
@@ -452,13 +584,16 @@ main() {
         exit 0
     fi
 
+    # 根据检测结果与用户选择决定使用的 BBR 算法
+    select_cc_algo
+
     echo ""
     echo -e "${YELLOW}开始 [${MODE}] 模式优化...${NC}"
-    sleep 1
 
     setup_swap
     load_modules
     apply_all_params
+    restart_proxy_panels
     final_summary
 }
 
