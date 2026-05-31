@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #=============================================================================
-# VPS Network Optimizer v3.4 (BBR 变种交互确认 · 智能首选 · 零 Bug)
-# 完全重构 · 零依赖 · 容器安全 · 输出透明 · 双栈支持 · 面板适配 · 动态BBR
+# VPS Network Optimizer
+# 零依赖 · 容器安全 · 输出透明 · 双栈支持
 # 用法：
 #   curl -fsSL RAW_URL | sudo bash
 #   curl -fsSL RAW_URL | sudo bash -s -- -u   # 激进模式
@@ -79,8 +79,8 @@ detect_environment() {
 print_header() {
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║       VPS Network Optimizer v3.4         ║${NC}"
-    echo -e "${CYAN}║   (BBR 交互确认 · 双栈 · 面板定制)       ║${NC}"
+    echo -e "${CYAN}║         VPS Network Optimizer            ║${NC}"
+    echo -e "${CYAN}║         (优化· 优化 · 还是优化)            ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════╝${NC}"
 }
 
